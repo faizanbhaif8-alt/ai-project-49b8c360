@@ -1,0 +1,70 @@
+from flask import Flask, request, jsonify
+import requests
+import json
+import os
+from datetime import datetime
+
+app = Flask(__name__)
+
+# API key for Alpha Vantage (replace with your own key)
+ALPHA_VANTAGE_API_KEY = os.getenv('ALPHA_VANTAGE_API_KEY', 'demo')
+
+@app.route('/get_stock_data', methods=['GET'])
+def get_stock_data():
+    symbol = request.args.get('symbol', 'IBM')  # Default to IBM if no symbol provided
+    interval = request.args.get('interval', '5min')  # Default to 5-minute interval
+    
+    try:
+        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol={symbol}&interval={interval}&apikey={ALPHA_VANTAGE_API_KEY}"
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Extract the latest data point
+        time_series = data.get(f'Time Series ({interval})', {})
+        latest_time = sorted(time_series.keys(), reverse=True)[0]
+        latest_data = time_series[latest_time]
+        
+        return jsonify({
+            'symbol': symbol,
+            'timestamp': latest_time,
+            'open': latest_data['1. open'],
+            'high': latest_data['2. high'],
+            'low': latest_data['3. low'],
+            'close': latest_data['4. close'],
+            'volume': latest_data['5. volume']
+        })
+    except requests.exceptions.RequestException as e:
+        return jsonify({'error': str(e)}), 500
+    except KeyError as e:
+        return jsonify({'error': 'Invalid data format from API'}), 500
+
+@app.route('/place_order', methods=['POST'])
+def place_order():
+    data = request.json
+    symbol = data.get('symbol')
+    quantity = data.get('quantity')
+    order_type = data.get('order_type', 'market')  # Default to market order
+    
+    if not symbol or not quantity:
+        return jsonify({'error': 'Missing symbol or quantity'}), 400
+    
+    try:
+        # Simulate order placement (in a real system, this would interact with a brokerage API)
+        order_id = f"ORDER_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        return jsonify({
+            'order_id': order_id,
+            'symbol': symbol,
+            'quantity': quantity,
+            'order_type': order_type,
+            'status': 'placed'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/')
+def index():
+    return "Welcome to Deep6 AI Trading Platform"
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
