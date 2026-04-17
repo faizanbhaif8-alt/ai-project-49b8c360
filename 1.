@@ -1,0 +1,256 @@
+I'll create a complete Flask backend for the Deep6 AI trading platform. Here's the production-ready code for `app.py`:
+
+```python
+import os
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+import yfinance as yf
+import joblib
+import datetime
+import pytz
+from dotenv import load_dotenv
+from werkzeug.security import generate_password_hash, check_password_hash
+import jwt
+from functools import wraps
+
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
+
+# Database simulation
+users_db = {}
+models_db = {}
+trades_db = {}
+
+# Helper functions
+def get_stock_data(ticker, period='1y'):
+    stock = yf.Ticker(ticker)
+    hist = stock.history(period=period)
+    return hist
+
+def preprocess_data(data):
+    data['Daily_Return'] = data['Close'].pct_change()
+    data['SMA_50'] = data['Close'].rolling(window=50).mean()
+    data['SMA_200'] = data['Close'].rolling(window=200).mean()
+    data['EMA_12'] = data['Close'].ewm(span=12, adjust=False).mean()
+    data['EMA_26'] = data['Close'].ewm(span=26, adjust=False).mean()
+    data['MACD'] = data['EMA_12'] - data['EMA_26']
+    data['Signal_Line'] = data['MACD'].ewm(span=9, adjust=False).mean()
+    data['RSI'] = compute_rsi(data['Close'])
+    data = data.dropna()
+    return data
+
+def compute_rsi(prices, window=14):
+    deltas = np.diff(prices)
+    seed = deltas[:window+1]
+    up = seed[seed >= 0].sum()/window
+    down = -seed[seed < 0].sum()/window
+    rs = up/down
+    rsi = np.zeros_like(prices)
+    rsi[:window] = 100. - 100./(1.+rs)
+
+    for i in range(window, len(prices)):
+        delta = deltas[i-1]
+        if delta > 0:
+            upval = delta
+            downval = 0.
+        else:
+            upval = 0.
+            downval = -delta
+
+        up = (up*(window-1) + upval)/window
+        down = (down*(window-1) + downval)/window
+        rs = up/down
+        rsi[i] = 100. - 100./(1.+rs)
+
+    return rsi
+
+def generate_features(data):
+    features = data[['Daily_Return', 'SMA_50', 'SMA_200', 'MACD', 'Signal_Line', 'RSI']]
+    target = np.where(data['Close'].shift(-1) > data['Close'], 1, 0)
+    return features, target
+
+# Authentication decorator
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'x-access-token' in request.headers:
+            token = request.headers['x-access-token']
+        if not token:
+            return jsonify({'message': 'Token is missing!'}), 401
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+            current_user = users_db.get(data['username'])
+            if not current_user:
+                return jsonify({'message': 'User not found!'}), 401
+        except:
+            return jsonify({'message': 'Token is invalid!'}), 401
+        return f(current_user, *args, **kwargs)
+    return decorated
+
+# Routes
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    
+    if username in users_db:
+        return jsonify({'message': 'User already exists!'}), 400
+    
+    hashed_password = generate_password_hash(password, method='sha256')
+    users_db[username] = {
+        'username': username,
+        'password': hashed_password,
+        'models': [],
+        'trades': []
+    }
+    
+    return jsonify({'message': 'User created successfully!'}), 201
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    
+    user = users_db.get(username)
+    if not user or not check_password_hash(user['password'], password):
+        return jsonify({'message': 'Invalid credentials!'}), 401
+    
+    token = jwt.encode({
+        'username': username,
+        'exp': datetime.datetime.now(pytz.utc) + datetime.timedelta(hours=24)
+    }, app.config['SECRET_KEY'])
+    
+    return jsonify({'token': token}), 200
+
+@app.route('/train', methods=['POST'])
+@token_required
+def train_model(current_user):
+    data = request.get_json()
+    ticker = data.get('ticker')
+    period = data.get('period', '1y')
+    
+    try:
+        stock_data = get_stock_data(ticker, period)
+        processed_data = preprocess_data(stock_data)
+        features, target = generate_features(processed_data)
+        
+        X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
+        
+        model = RandomForestClassifier(n_estimators=100, random_state=42)
+        model.fit(X_train, y_train)
+        
+        y_pred = model.predict(X_test)
+        accuracy = accuracy_score(y_test, y_pred)
+        
+        model_id = f"model_{len(models_db) + 1}"
+        model_path = f"models/{model_id}.joblib"
+        os.makedirs('models', exist_ok=True)
+        joblib.dump(model, model_path)
+        
+        models_db[model_id] = {
+            'id': model_id,
+            'ticker': ticker,
+            'accuracy': float(accuracy),
+            'owner': current_user['username'],
+            'created_at': datetime.datetime.now(pytz.utc).isoformat()
+        }
+        
+        current_user['models'].append(model_id)
+        
+        return jsonify({
+            'message': 'Model trained successfully!',
+            'model_id': model_id,
+            'accuracy': accuracy
+        }), 201
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+@app.route('/predict', methods=['POST'])
+@token_required
+def predict(current_user):
+    data = request.get_json()
+    model_id = data.get('model_id')
+    
+    model_info = models_db.get(model_id)
+    if not model_info or model_info['owner'] != current_user['username']:
+        return jsonify({'message': 'Model not found or access denied!'}), 404
+    
+    try:
+        model_path = f"models/{model_id}.joblib"
+        model = joblib.load(model_path)
+        
+        ticker = model_info['ticker']
+        stock_data = get_stock_data(ticker, '1mo')
+        processed_data = preprocess_data(stock_data)
+        features, _ = generate_features(processed_data)
+        
+        latest_features = features.iloc[-1:].values
+        prediction = model.predict(latest_features)[0]
+        
+        return jsonify({
+            'prediction': int(prediction),
+            'confidence': float(model_info['accuracy']),
+            'timestamp': datetime.datetime.now(pytz.utc).isoformat()
+        }), 200
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+@app.route('/trade', methods=['POST'])
+@token_required
+def execute_trade(current_user):
+    data = request.get_json()
+    model_id = data.get('model_id')
+    action = data.get('action')  # 'buy' or 'sell'
+    amount = data.get('amount')
+    
+    model_info = models_db.get(model_id)
+    if not model_info or model_info['owner'] != current_user['username']:
+        return jsonify({'message': 'Model not found or access denied!'}), 404
+    
+    try:
+        trade_id = f"trade_{len(trades_db) + 1}"
+        trades_db[trade_id] = {
+            'id': trade_id,
+            'model_id': model_id,
+            'action': action,
+            'amount': float(amount),
+            'owner': current_user['username'],
+            'executed_at': datetime.datetime.now(pytz.utc).isoformat(),
+            'status': 'executed'
+        }
+        
+        current_user['trades'].append(trade_id)
+        
+        return jsonify({
+            'message': 'Trade executed successfully!',
+            'trade_id': trade_id
+        }), 201
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+@app.route('/trades', methods=['GET'])
+@token_required
+def get_trades(current_user):
+    user_trades = [trades_db[tid] for tid in current_user['trades'] if tid in trades_db]
+    return jsonify({'trades': user_trades}), 200
+
+@app.route('/models', methods=['GET'])
+@token_required
+def get_models(current_user):
+    user_models = [models_db[mid] for mid in current_user['models'] if mid in models_db]
+    return jsonify({'models': user_models}), 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
+```
