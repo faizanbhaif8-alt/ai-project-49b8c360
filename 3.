@@ -1,0 +1,127 @@
+Here's a complete Flask backend for the Deep6 AI trading platform:
+
+```python
+# app.py
+from flask import Flask, request, jsonify
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import yfinance as yf
+import joblib
+import os
+from datetime import datetime, timedelta
+
+app = Flask(__name__)
+
+# Configuration
+MODEL_PATH = 'trading_model.pkl'
+SCALER_PATH = 'scaler.pkl'
+TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META']
+LOOKBACK_DAYS = 30
+
+class TradingModel:
+    def __init__(self):
+        self.model = None
+        self.scaler = None
+        self.load_or_train_model()
+
+    def load_or_train_model(self):
+        if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
+            self.model = joblib.load(MODEL_PATH)
+            self.scaler = joblib.load(SCALER_PATH)
+        else:
+            self.train_model()
+    
+    def fetch_data(self, ticker):
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=LOOKBACK_DAYS*2)
+        data = yf.download(ticker, start=start_date, end=end_date)
+        return data
+    
+    def preprocess_data(self, data):
+        data['Returns'] = data['Close'].pct_change()
+        data['Volatility'] = data['Returns'].rolling(window=5).std()
+        data['MA_5'] = data['Close'].rolling(window=5).mean()
+        data['MA_10'] = data['Close'].rolling(window=10).mean()
+        data['Target'] = data['Close'].shift(-1)
+        data.dropna(inplace=True)
+        return data
+    
+    def train_model(self):
+        all_data = pd.DataFrame()
+        for ticker in TICKERS:
+            data = self.fetch_data(ticker)
+            processed = self.preprocess_data(data)
+            processed['Ticker'] = ticker
+            all_data = pd.concat([all_data, processed])
+        
+        features = ['Returns', 'Volatility', 'MA_5', 'MA_10']
+        X = all_data[features]
+        y = all_data['Target']
+        
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(X)
+        
+        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2)
+        
+        self.model = RandomForestRegressor(n_estimators=100, random_state=42)
+        self.model.fit(X_train, y_train)
+        
+        joblib.dump(self.model, MODEL_PATH)
+        joblib.dump(self.scaler, SCALER_PATH)
+    
+    def predict(self, ticker):
+        data = self.fetch_data(ticker)
+        processed = self.preprocess_data(data)
+        features = ['Returns', 'Volatility', 'MA_5', 'MA_10']
+        X = processed[features].tail(1)
+        X_scaled = self.scaler.transform(X)
+        prediction = self.model.predict(X_scaled)
+        return prediction[0]
+
+trading_model = TradingModel()
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    try:
+        data = request.get_json()
+        ticker = data.get('ticker', 'AAPL')
+        prediction = trading_model.predict(ticker)
+        return jsonify({
+            'ticker': ticker,
+            'predicted_price': float(prediction),
+            'status': 'success'
+        })
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'status': 'error'
+        }), 400
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy'})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
+```
+
+```python
+# requirements.txt
+flask==2.3.2
+numpy==1.24.3
+pandas==2.0.2
+scikit-learn==1.2.2
+yfinance==0.2.18
+joblib==1.2.0
+gunicorn==20.1.0
+```
+
+```python
+# Procfile
+web: gunicorn app:app
+```
+
+This completes the backend implementation for the Deep6 AI trading platform. The code includes model training, prediction endpoints, and all necessary dependencies for deployment on Replit.
